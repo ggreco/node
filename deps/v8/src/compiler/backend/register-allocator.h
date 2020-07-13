@@ -618,14 +618,14 @@ class V8_EXPORT_PRIVATE LiveRange : public NON_EXPORTED_BASE(ZoneObject) {
   LiveRange* SplitAt(LifetimePosition position, Zone* zone);
 
   // Returns nullptr when no register is hinted, otherwise sets register_index.
-  UsePosition* FirstHintPosition(int* register_index) const;
-  UsePosition* FirstHintPosition() const {
+  // Uses {current_hint_position_} as a cache, and tries to update it.
+  UsePosition* FirstHintPosition(int* register_index);
+  UsePosition* FirstHintPosition() {
     int register_index;
     return FirstHintPosition(&register_index);
   }
 
   UsePosition* current_hint_position() const {
-    DCHECK(current_hint_position_ == FirstHintPosition());
     return current_hint_position_;
   }
 
@@ -656,6 +656,7 @@ class V8_EXPORT_PRIVATE LiveRange : public NON_EXPORTED_BASE(ZoneObject) {
                             const InstructionOperand& spill_op);
   void SetUseHints(int register_index);
   void UnsetUseHints() { SetUseHints(kUnassignedRegister); }
+  void ResetCurrentHintPosition() { current_hint_position_ = first_pos_; }
 
   void Print(const RegisterConfiguration* config, bool with_children) const;
   void Print(bool with_children) const;
@@ -667,6 +668,8 @@ class V8_EXPORT_PRIVATE LiveRange : public NON_EXPORTED_BASE(ZoneObject) {
 
  private:
   friend class TopLevelLiveRange;
+  friend Zone;
+
   explicit LiveRange(int relative_id, MachineRepresentation rep,
                      TopLevelLiveRange* top_level);
 
@@ -701,10 +704,10 @@ class V8_EXPORT_PRIVATE LiveRange : public NON_EXPORTED_BASE(ZoneObject) {
   mutable UseInterval* current_interval_;
   // This is used as a cache, it doesn't affect correctness.
   mutable UsePosition* last_processed_use_;
-  // This is used as a cache, it's invalid outside of BuildLiveRanges.
-  mutable UsePosition* current_hint_position_;
   // Cache the last position splintering stopped at.
   mutable UsePosition* splitting_pointer_;
+  // This is used as a cache in BuildLiveRanges and during register allocation.
+  UsePosition* current_hint_position_;
   LiveRangeBundle* bundle_ = nullptr;
   // Next interval start, relative to the current linear scan position.
   LifetimePosition next_start_;
@@ -732,6 +735,7 @@ class LiveRangeBundle : public ZoneObject {
 
  private:
   friend class BundleBuilder;
+  friend Zone;
 
   // Representation of the non-empty interval [start,end[.
   class Range {
@@ -915,7 +919,7 @@ class V8_EXPORT_PRIVATE TopLevelLiveRange final : public LiveRange {
     spilled_in_deferred_blocks_ = true;
     spill_move_insertion_locations_ = nullptr;
     list_of_blocks_requiring_spill_operands_ =
-        new (zone) BitVector(total_block_count, zone);
+        zone->New<BitVector>(total_block_count, zone);
   }
 
   // Updates internal data structures to reflect that this range is not
@@ -924,7 +928,7 @@ class V8_EXPORT_PRIVATE TopLevelLiveRange final : public LiveRange {
     spill_start_index_ = -1;
     spill_move_insertion_locations_ = nullptr;
     list_of_blocks_requiring_spill_operands_ =
-        new (zone) BitVector(total_block_count, zone);
+        zone->New<BitVector>(total_block_count, zone);
   }
 
   // Promotes this range to spill at definition if it was marked for spilling
@@ -951,7 +955,13 @@ class V8_EXPORT_PRIVATE TopLevelLiveRange final : public LiveRange {
 
   void Verify() const;
   void VerifyChildrenInOrder() const;
+
+  // Returns the LiveRange covering the given position, or nullptr if no such
+  // range exists. Uses a linear search through child ranges. The range at the
+  // previously requested position is cached, so this function will be very fast
+  // if you call it with a non-decreasing sequence of positions.
   LiveRange* GetChildCovers(LifetimePosition pos);
+
   int GetNextChildId() {
     return IsSplinter() ? splintered_from()->GetNextChildId()
                         : ++last_child_id_;

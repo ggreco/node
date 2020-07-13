@@ -209,14 +209,11 @@ RUNTIME_FUNCTION(Runtime_WasmCompileLazy) {
 }
 
 // Should be called from within a handle scope
-Handle<JSArrayBuffer> GetSharedArrayBuffer(Handle<WasmInstanceObject> instance,
-                                           Isolate* isolate, uint32_t address) {
+Handle<JSArrayBuffer> GetArrayBuffer(Handle<WasmInstanceObject> instance,
+                                     Isolate* isolate, uint32_t address) {
   DCHECK(instance->has_memory_object());
   Handle<JSArrayBuffer> array_buffer(instance->memory_object().array_buffer(),
                                      isolate);
-
-  // Validation should have failed if the memory was not shared.
-  DCHECK(array_buffer->is_shared());
 
   // Should have trapped if address was OOB
   DCHECK_LT(address, array_buffer->byte_length());
@@ -231,8 +228,12 @@ RUNTIME_FUNCTION(Runtime_WasmAtomicNotify) {
   CONVERT_NUMBER_CHECKED(uint32_t, address, Uint32, args[1]);
   CONVERT_NUMBER_CHECKED(uint32_t, count, Uint32, args[2]);
   Handle<JSArrayBuffer> array_buffer =
-      GetSharedArrayBuffer(instance, isolate, address);
-  return FutexEmulation::Wake(array_buffer, address, count);
+      GetArrayBuffer(instance, isolate, address);
+  if (array_buffer->is_shared()) {
+    return FutexEmulation::Wake(array_buffer, address, count);
+  } else {
+    return Smi::FromInt(0);
+  }
 }
 
 RUNTIME_FUNCTION(Runtime_WasmI32AtomicWait) {
@@ -245,7 +246,12 @@ RUNTIME_FUNCTION(Runtime_WasmI32AtomicWait) {
   CONVERT_ARG_HANDLE_CHECKED(BigInt, timeout_ns, 3);
 
   Handle<JSArrayBuffer> array_buffer =
-      GetSharedArrayBuffer(instance, isolate, address);
+      GetArrayBuffer(instance, isolate, address);
+
+  // Trap if memory is not shared
+  if (!array_buffer->is_shared()) {
+    return ThrowWasmError(isolate, MessageTemplate::kAtomicsWaitNotAllowed);
+  }
   return FutexEmulation::WaitWasm32(isolate, array_buffer, address,
                                     expected_value, timeout_ns->AsInt64());
 }
@@ -260,7 +266,12 @@ RUNTIME_FUNCTION(Runtime_WasmI64AtomicWait) {
   CONVERT_ARG_HANDLE_CHECKED(BigInt, timeout_ns, 3);
 
   Handle<JSArrayBuffer> array_buffer =
-      GetSharedArrayBuffer(instance, isolate, address);
+      GetArrayBuffer(instance, isolate, address);
+
+  // Trap if memory is not shared
+  if (!array_buffer->is_shared()) {
+    return ThrowWasmError(isolate, MessageTemplate::kAtomicsWaitNotAllowed);
+  }
   return FutexEmulation::WaitWasm64(isolate, array_buffer, address,
                                     expected_value->AsInt64(),
                                     timeout_ns->AsInt64());
@@ -344,6 +355,9 @@ RUNTIME_FUNCTION(Runtime_WasmTableInit) {
   CONVERT_ARG_HANDLE_CHECKED(WasmInstanceObject, instance, 0);
   CONVERT_UINT32_ARG_CHECKED(table_index, 1);
   CONVERT_UINT32_ARG_CHECKED(elem_segment_index, 2);
+  static_assert(
+      wasm::kV8MaxWasmTableSize < kSmiMaxValue,
+      "Make sure clamping to Smi range doesn't make an invalid call valid");
   CONVERT_UINT32_ARG_CHECKED(dst, 3);
   CONVERT_UINT32_ARG_CHECKED(src, 4);
   CONVERT_UINT32_ARG_CHECKED(count, 5);
@@ -363,6 +377,9 @@ RUNTIME_FUNCTION(Runtime_WasmTableCopy) {
   CONVERT_ARG_HANDLE_CHECKED(WasmInstanceObject, instance, 0);
   CONVERT_UINT32_ARG_CHECKED(table_dst_index, 1);
   CONVERT_UINT32_ARG_CHECKED(table_src_index, 2);
+  static_assert(
+      wasm::kV8MaxWasmTableSize < kSmiMaxValue,
+      "Make sure clamping to Smi range doesn't make an invalid call valid");
   CONVERT_UINT32_ARG_CHECKED(dst, 3);
   CONVERT_UINT32_ARG_CHECKED(src, 4);
   CONVERT_UINT32_ARG_CHECKED(count, 5);
@@ -440,14 +457,13 @@ RUNTIME_FUNCTION(Runtime_WasmDebugBreak) {
   // Enter the debugger.
   DebugScope debug_scope(isolate->debug());
 
-  const auto undefined = ReadOnlyRoots(isolate).undefined_value();
   WasmFrame* frame = frame_finder.frame();
   auto* debug_info = frame->native_module()->GetDebugInfo();
   if (debug_info->IsStepping(frame)) {
-    debug_info->ClearStepping();
+    debug_info->ClearStepping(isolate);
     isolate->debug()->ClearStepping();
     isolate->debug()->OnDebugBreak(isolate->factory()->empty_fixed_array());
-    return undefined;
+    return ReadOnlyRoots(isolate).undefined_value();
   }
 
   // Check whether we hit a breakpoint.
@@ -455,7 +471,7 @@ RUNTIME_FUNCTION(Runtime_WasmDebugBreak) {
   Handle<FixedArray> breakpoints;
   if (WasmScript::CheckBreakPoints(isolate, script, position)
           .ToHandle(&breakpoints)) {
-    debug_info->ClearStepping();
+    debug_info->ClearStepping(isolate);
     isolate->debug()->ClearStepping();
     if (isolate->debug()->break_points_active()) {
       // We hit one or several breakpoints. Notify the debug listeners.
@@ -474,7 +490,68 @@ RUNTIME_FUNCTION(Runtime_WasmDebugBreak) {
     debug_info->RemoveBreakpoint(frame->function_index(), position, isolate);
   }
 
-  return undefined;
+  return ReadOnlyRoots(isolate).undefined_value();
+}
+
+namespace {
+
+// TODO(7748): Consider storing this array in Maps'
+// "transitions_or_prototype_info" slot.
+// Also consider being more memory-efficient, e.g. use inline storage for
+// single entries, and/or adapt the growth strategy.
+class RttSubtypes : public ArrayList {
+ public:
+  static Handle<ArrayList> Insert(Isolate* isolate, Handle<ArrayList> array,
+                                  uint32_t type_index, Handle<Map> sub_rtt) {
+    Handle<Smi> key = handle(Smi::FromInt(type_index), isolate);
+    return Add(isolate, array, key, sub_rtt);
+  }
+
+  static Map SearchSubtype(Handle<ArrayList> array, uint32_t type_index) {
+    // Linear search for now.
+    // TODO(7748): Consider keeping the array sorted and using binary search
+    // here, if empirical data indicates that that would be worthwhile.
+    int count = array->Length();
+    for (int i = 0; i < count; i += 2) {
+      if (Smi::cast(array->Get(i)).value() == static_cast<int>(type_index)) {
+        return Map::cast(array->Get(i + 1));
+      }
+    }
+    return {};
+  }
+};
+
+}  // namespace
+
+RUNTIME_FUNCTION(Runtime_WasmAllocateRtt) {
+  ClearThreadInWasmScope flag_scope;
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());
+  CONVERT_UINT32_ARG_CHECKED(type_index, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Map, parent, 1);
+  // Check for an existing RTT first.
+  DCHECK(parent->IsWasmStructMap() || parent->IsWasmArrayMap());
+  Handle<ArrayList> cache(parent->wasm_type_info().subtypes(), isolate);
+  Map maybe_cached = RttSubtypes::SearchSubtype(cache, type_index);
+  if (!maybe_cached.is_null()) return maybe_cached;
+
+  // Allocate a fresh RTT otherwise.
+  Handle<WasmInstanceObject> instance(GetWasmInstanceOnStackTop(isolate),
+                                      isolate);
+  const wasm::WasmModule* module = instance->module();
+  Handle<Map> rtt;
+  if (wasm::HeapType(type_index).is_generic()) {
+    rtt = wasm::CreateGenericRtt(isolate, module, parent);
+  } else if (module->has_struct(type_index)) {
+    rtt = wasm::CreateStructMap(isolate, module, type_index, parent);
+  } else if (module->has_array(type_index)) {
+    rtt = wasm::CreateArrayMap(isolate, module, type_index, parent);
+  } else {
+    UNREACHABLE();
+  }
+  cache = RttSubtypes::Insert(isolate, cache, type_index, rtt);
+  parent->wasm_type_info().set_subtypes(*cache);
+  return *rtt;
 }
 
 }  // namespace internal

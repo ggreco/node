@@ -10,8 +10,6 @@
 #include <sstream>
 #include <vector>
 
-#include "src/objects/objects-inl.h"
-
 #include "src/api/api-arguments-inl.h"
 #include "src/api/api-natives.h"
 #include "src/api/api.h"
@@ -33,6 +31,8 @@
 #include "src/execution/execution.h"
 #include "src/execution/frames-inl.h"
 #include "src/execution/isolate-inl.h"
+#include "src/execution/isolate-utils-inl.h"
+#include "src/execution/isolate-utils.h"
 #include "src/execution/microtask-queue.h"
 #include "src/execution/off-thread-isolate.h"
 #include "src/execution/protectors-inl.h"
@@ -69,6 +69,7 @@
 #include "src/objects/lookup-inl.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/objects-body-descriptors-inl.h"
+#include "src/objects/objects-inl.h"
 #include "src/objects/property-details.h"
 #include "src/roots/roots.h"
 #include "src/utils/identity-map.h"
@@ -2358,25 +2359,25 @@ bool HeapObject::CanBeRehashed() const {
   return false;
 }
 
-void HeapObject::RehashBasedOnMap(Isolate* isolate) {
-  ReadOnlyRoots roots = ReadOnlyRoots(isolate);
+void HeapObject::RehashBasedOnMap(LocalIsolateWrapper isolate) {
+  const Isolate* ptr_cmp_isolate = GetIsolateForPtrCompr(isolate);
   switch (map().instance_type()) {
     case HASH_TABLE_TYPE:
       UNREACHABLE();
     case NAME_DICTIONARY_TYPE:
-      NameDictionary::cast(*this).Rehash(roots);
+      NameDictionary::cast(*this).Rehash(ptr_cmp_isolate);
       break;
     case GLOBAL_DICTIONARY_TYPE:
-      GlobalDictionary::cast(*this).Rehash(roots);
+      GlobalDictionary::cast(*this).Rehash(ptr_cmp_isolate);
       break;
     case NUMBER_DICTIONARY_TYPE:
-      NumberDictionary::cast(*this).Rehash(roots);
+      NumberDictionary::cast(*this).Rehash(ptr_cmp_isolate);
       break;
     case SIMPLE_NUMBER_DICTIONARY_TYPE:
-      SimpleNumberDictionary::cast(*this).Rehash(roots);
+      SimpleNumberDictionary::cast(*this).Rehash(ptr_cmp_isolate);
       break;
     case STRING_TABLE_TYPE:
-      StringTable::cast(*this).Rehash(roots);
+      StringTable::cast(*this).Rehash(ptr_cmp_isolate);
       break;
     case DESCRIPTOR_ARRAY_TYPE:
       DCHECK_LE(1, DescriptorArray::cast(*this).number_of_descriptors());
@@ -2395,11 +2396,13 @@ void HeapObject::RehashBasedOnMap(Isolate* isolate) {
     case ORDERED_HASH_SET_TYPE:
       UNREACHABLE();  // We'll rehash from the JSMap or JSSet referencing them.
     case JS_MAP_TYPE: {
-      JSMap::cast(*this).Rehash(isolate);
+      DCHECK(isolate.is_main_thread());
+      JSMap::cast(*this).Rehash(isolate.main_thread());
       break;
     }
     case JS_SET_TYPE: {
-      JSSet::cast(*this).Rehash(isolate);
+      DCHECK(isolate.is_main_thread());
+      JSSet::cast(*this).Rehash(isolate.main_thread());
       break;
     }
     case SMALL_ORDERED_NAME_DICTIONARY_TYPE:
@@ -5188,7 +5191,8 @@ bool SharedFunctionInfo::PassesFilter(const char* raw_filter) {
 bool SharedFunctionInfo::HasSourceCode() const {
   ReadOnlyRoots roots = GetReadOnlyRoots();
   return !script().IsUndefined(roots) &&
-         !Script::cast(script()).source().IsUndefined(roots);
+         !Script::cast(script()).source().IsUndefined(roots) &&
+         String::cast(Script::cast(script()).source()).length() > 0;
 }
 
 void SharedFunctionInfo::DiscardCompiledMetadata(
@@ -5525,12 +5529,20 @@ int SharedFunctionInfo::StartPosition() const {
     if (info.HasPositionInfo()) {
       return info.StartPosition();
     }
-  } else if (HasUncompiledData()) {
+  }
+  if (HasUncompiledData()) {
     // Works with or without scope.
     return uncompiled_data().start_position();
-  } else if (IsApiFunction() || HasBuiltinId()) {
+  }
+  if (IsApiFunction() || HasBuiltinId()) {
     DCHECK_IMPLIES(HasBuiltinId(), builtin_id() != Builtins::kCompileLazy);
     return 0;
+  }
+  if (HasWasmExportedFunctionData()) {
+    WasmInstanceObject instance = wasm_exported_function_data().instance();
+    int func_index = wasm_exported_function_data().function_index();
+    auto& function = instance.module()->functions[func_index];
+    return static_cast<int>(function.code.offset());
   }
   return kNoSourcePosition;
 }
@@ -5542,12 +5554,20 @@ int SharedFunctionInfo::EndPosition() const {
     if (info.HasPositionInfo()) {
       return info.EndPosition();
     }
-  } else if (HasUncompiledData()) {
+  }
+  if (HasUncompiledData()) {
     // Works with or without scope.
     return uncompiled_data().end_position();
-  } else if (IsApiFunction() || HasBuiltinId()) {
+  }
+  if (IsApiFunction() || HasBuiltinId()) {
     DCHECK_IMPLIES(HasBuiltinId(), builtin_id() != Builtins::kCompileLazy);
     return 0;
+  }
+  if (HasWasmExportedFunctionData()) {
+    WasmInstanceObject instance = wasm_exported_function_data().instance();
+    int func_index = wasm_exported_function_data().function_index();
+    auto& function = instance.module()->functions[func_index];
+    return static_cast<int>(function.code.end_offset());
   }
   return kNoSourcePosition;
 }
@@ -5733,17 +5753,27 @@ const char* AllocationSite::PretenureDecisionName(PretenureDecision decision) {
   return nullptr;
 }
 
+// static
+bool JSArray::MayHaveReadOnlyLength(Map js_array_map) {
+  DCHECK(js_array_map.IsJSArrayMap());
+  if (js_array_map.is_dictionary_map()) return true;
+
+  // Fast path: "length" is the first fast property of arrays with non
+  // dictionary properties. Since it's not configurable, it's guaranteed to be
+  // the first in the descriptor array.
+  InternalIndex first(0);
+  DCHECK(js_array_map.instance_descriptors().GetKey(first) ==
+         js_array_map.GetReadOnlyRoots().length_string());
+  return js_array_map.instance_descriptors().GetDetails(first).IsReadOnly();
+}
+
 bool JSArray::HasReadOnlyLength(Handle<JSArray> array) {
   Map map = array->map();
-  // Fast path: "length" is the first fast property of arrays. Since it's not
-  // configurable, it's guaranteed to be the first in the descriptor array.
-  if (!map.is_dictionary_map()) {
-    InternalIndex first(0);
-    DCHECK(map.instance_descriptors().GetKey(first) ==
-           array->GetReadOnlyRoots().length_string());
-    return map.instance_descriptors().GetDetails(first).IsReadOnly();
-  }
 
+  // If map guarantees that there can't be a read-only length, we are done.
+  if (!MayHaveReadOnlyLength(map)) return false;
+
+  // Look at the object.
   Isolate* isolate = array->GetIsolate();
   LookupIterator it(isolate, array, isolate->factory()->length_string(), array,
                     LookupIterator::OWN_SKIP_INTERCEPTOR);
@@ -5767,14 +5797,15 @@ bool JSArray::WouldChangeReadOnlyLength(Handle<JSArray> array, uint32_t index) {
 template <typename Derived, typename Shape>
 void Dictionary<Derived, Shape>::Print(std::ostream& os) {
   DisallowHeapAllocation no_gc;
-  ReadOnlyRoots roots = this->GetReadOnlyRoots();
+  const Isolate* isolate = GetIsolateForPtrCompr(*this);
+  ReadOnlyRoots roots = this->GetReadOnlyRoots(isolate);
   Derived dictionary = Derived::cast(*this);
   for (InternalIndex i : dictionary.IterateEntries()) {
-    Object k = dictionary.KeyAt(i);
+    Object k = dictionary.KeyAt(isolate, i);
     if (!dictionary.ToKey(roots, i, &k)) continue;
     os << "\n   ";
     if (k.IsString()) {
-      String::cast(k).StringPrint(os);
+      String::cast(k).PrintUC16(os);
     } else {
       os << Brief(k);
     }
@@ -5812,10 +5843,8 @@ void Symbol::SymbolShortPrint(std::ostream& os) {
   os << "<Symbol:";
   if (!description().IsUndefined()) {
     os << " ";
-    HeapStringAllocator allocator;
-    StringStream accumulator(&allocator);
-    String::cast(description()).StringShortPrint(&accumulator, false);
-    os << accumulator.ToCString().get();
+    String description_as_string = String::cast(description());
+    description_as_string.PrintUC16(os, 0, description_as_string.length());
   } else {
     os << " (" << PrivateSymbolToName() << ")";
   }
@@ -6192,12 +6221,12 @@ Handle<Object> JSPromise::TriggerPromiseReactions(Isolate* isolate,
 // static
 JSRegExp::Flags JSRegExp::FlagsFromString(Isolate* isolate,
                                           Handle<String> flags, bool* success) {
-  STATIC_ASSERT(JSRegExp::FlagFromChar('g') == JSRegExp::kGlobal);
-  STATIC_ASSERT(JSRegExp::FlagFromChar('i') == JSRegExp::kIgnoreCase);
-  STATIC_ASSERT(JSRegExp::FlagFromChar('m') == JSRegExp::kMultiline);
-  STATIC_ASSERT(JSRegExp::FlagFromChar('s') == JSRegExp::kDotAll);
-  STATIC_ASSERT(JSRegExp::FlagFromChar('u') == JSRegExp::kUnicode);
-  STATIC_ASSERT(JSRegExp::FlagFromChar('y') == JSRegExp::kSticky);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('g') == JSRegExp::kGlobal);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('i') == JSRegExp::kIgnoreCase);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('m') == JSRegExp::kMultiline);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('s') == JSRegExp::kDotAll);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('u') == JSRegExp::kUnicode);
+  STATIC_ASSERT(*JSRegExp::FlagFromChar('y') == JSRegExp::kSticky);
 
   int length = flags->length();
   if (length == 0) {
@@ -6206,14 +6235,16 @@ JSRegExp::Flags JSRegExp::FlagsFromString(Isolate* isolate,
   }
   // A longer flags string cannot be valid.
   if (length > JSRegExp::kFlagCount) return JSRegExp::Flags(0);
-  // Initialize {value} to {kInvalid} to allow 2-in-1 duplicate/invalid check.
-  JSRegExp::Flags value = JSRegExp::kInvalid;
+  JSRegExp::Flags value(0);
   if (flags->IsSeqOneByteString()) {
     DisallowHeapAllocation no_gc;
     SeqOneByteString seq_flags = SeqOneByteString::cast(*flags);
     for (int i = 0; i < length; i++) {
-      JSRegExp::Flag flag = JSRegExp::FlagFromChar(seq_flags.Get(i));
-      // Duplicate or invalid flag.
+      base::Optional<JSRegExp::Flag> maybe_flag =
+          JSRegExp::FlagFromChar(seq_flags.Get(i));
+      if (!maybe_flag.has_value()) return JSRegExp::Flags(0);
+      JSRegExp::Flag flag = *maybe_flag;
+      // Duplicate flag.
       if (value & flag) return JSRegExp::Flags(0);
       value |= flag;
     }
@@ -6222,15 +6253,16 @@ JSRegExp::Flags JSRegExp::FlagsFromString(Isolate* isolate,
     DisallowHeapAllocation no_gc;
     String::FlatContent flags_content = flags->GetFlatContent(no_gc);
     for (int i = 0; i < length; i++) {
-      JSRegExp::Flag flag = JSRegExp::FlagFromChar(flags_content.Get(i));
-      // Duplicate or invalid flag.
+      base::Optional<JSRegExp::Flag> maybe_flag =
+          JSRegExp::FlagFromChar(flags_content.Get(i));
+      if (!maybe_flag.has_value()) return JSRegExp::Flags(0);
+      JSRegExp::Flag flag = *maybe_flag;
+      // Duplicate flag.
       if (value & flag) return JSRegExp::Flags(0);
       value |= flag;
     }
   }
   *success = true;
-  // Drop the initially set {kInvalid} bit.
-  value ^= JSRegExp::kInvalid;
   return value;
 }
 
@@ -6609,7 +6641,7 @@ Handle<Derived> HashTable<Derived, Shape>::NewInternal(
   auto* factory = isolate->factory();
   int length = EntryToIndex(InternalIndex(capacity));
   Handle<FixedArray> array = factory->NewFixedArrayWithMap(
-      Shape::GetMap(ReadOnlyRoots(isolate)), length, allocation);
+      Derived::GetMap(ReadOnlyRoots(isolate)), length, allocation);
   Handle<Derived> table = Handle<Derived>::cast(array);
 
   table->SetNumberOfElements(0);
@@ -6619,7 +6651,8 @@ Handle<Derived> HashTable<Derived, Shape>::NewInternal(
 }
 
 template <typename Derived, typename Shape>
-void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots, Derived new_table) {
+void HashTable<Derived, Shape>::Rehash(const Isolate* isolate,
+                                       Derived new_table) {
   DisallowHeapAllocation no_gc;
   WriteBarrierMode mode = new_table.GetWriteBarrierMode(no_gc);
 
@@ -6627,19 +6660,21 @@ void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots, Derived new_table) {
 
   // Copy prefix to new array.
   for (int i = kPrefixStartIndex; i < kElementsStartIndex; i++) {
-    new_table.set(i, get(i), mode);
+    new_table.set(i, get(isolate, i), mode);
   }
 
   // Rehash the elements.
+  ReadOnlyRoots roots = GetReadOnlyRoots(isolate);
   for (InternalIndex i : this->IterateEntries()) {
     uint32_t from_index = EntryToIndex(i);
-    Object k = this->get(from_index);
-    if (!Shape::IsLive(roots, k)) continue;
+    Object k = this->get(isolate, from_index);
+    if (!IsKey(roots, k)) continue;
     uint32_t hash = Shape::HashForObject(roots, k);
-    uint32_t insertion_index = EntryToIndex(new_table.FindInsertionEntry(hash));
-    new_table.set_key(insertion_index, get(from_index), mode);
+    uint32_t insertion_index =
+        EntryToIndex(new_table.FindInsertionEntry(isolate, roots, hash));
+    new_table.set_key(insertion_index, get(isolate, from_index), mode);
     for (int j = 1; j < Shape::kEntrySize; j++) {
-      new_table.set(insertion_index + j, get(from_index + j), mode);
+      new_table.set(insertion_index + j, get(isolate, from_index + j), mode);
     }
   }
   new_table.SetNumberOfElements(NumberOfElements());
@@ -6681,9 +6716,10 @@ void HashTable<Derived, Shape>::Swap(InternalIndex entry1, InternalIndex entry2,
 }
 
 template <typename Derived, typename Shape>
-void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots) {
+void HashTable<Derived, Shape>::Rehash(const Isolate* isolate) {
   DisallowHeapAllocation no_gc;
   WriteBarrierMode mode = GetWriteBarrierMode(no_gc);
+  ReadOnlyRoots roots = GetReadOnlyRoots(isolate);
   uint32_t capacity = Capacity();
   bool done = false;
   for (int probe = 1; !done; probe++) {
@@ -6692,8 +6728,8 @@ void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots) {
     done = true;
     for (InternalIndex current(0); current.raw_value() < capacity;
          /* {current} is advanced manually below, when appropriate.*/) {
-      Object current_key = KeyAt(current);
-      if (!Shape::IsLive(roots, current_key)) {
+      Object current_key = KeyAt(isolate, current);
+      if (!IsKey(roots, current_key)) {
         ++current;  // Advance to next entry.
         continue;
       }
@@ -6702,8 +6738,8 @@ void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots) {
         ++current;  // Advance to next entry.
         continue;
       }
-      Object target_key = KeyAt(target);
-      if (!Shape::IsLive(roots, target_key) ||
+      Object target_key = KeyAt(isolate, target);
+      if (!IsKey(roots, target_key) ||
           EntryForProbe(roots, target_key, probe, target) != target) {
         // Put the current element into the correct position.
         Swap(current, target, mode);
@@ -6722,7 +6758,7 @@ void HashTable<Derived, Shape>::Rehash(ReadOnlyRoots roots) {
   HeapObject undefined = roots.undefined_value();
   Derived* self = static_cast<Derived*>(this);
   for (InternalIndex current : InternalIndex::Range(capacity)) {
-    if (KeyAt(current) == the_hole) {
+    if (KeyAt(isolate, current) == the_hole) {
       self->set_key(EntryToIndex(current) + kEntryKeyIndex, undefined,
                     SKIP_WRITE_BARRIER);
     }
@@ -6748,7 +6784,7 @@ Handle<Derived> HashTable<Derived, Shape>::EnsureCapacity(
       isolate, new_nof,
       should_pretenure ? AllocationType::kOld : AllocationType::kYoung);
 
-  table->Rehash(ReadOnlyRoots(isolate), *new_table);
+  table->Rehash(GetIsolateForPtrCompr(isolate), *new_table);
   return new_table;
 }
 
@@ -6795,22 +6831,26 @@ Handle<Derived> HashTable<Derived, Shape>::Shrink(Isolate* isolate,
                      pretenure ? AllocationType::kOld : AllocationType::kYoung,
                      USE_CUSTOM_MINIMUM_CAPACITY);
 
-  table->Rehash(ReadOnlyRoots(isolate), *new_table);
+  table->Rehash(isolate, *new_table);
   return new_table;
 }
 
 template <typename Derived, typename Shape>
-InternalIndex HashTable<Derived, Shape>::FindInsertionEntry(uint32_t hash) {
+InternalIndex HashTable<Derived, Shape>::FindInsertionEntry(
+    const Isolate* isolate, ReadOnlyRoots roots, uint32_t hash) {
   uint32_t capacity = Capacity();
-  InternalIndex entry = FirstProbe(hash, capacity);
   uint32_t count = 1;
   // EnsureCapacity will guarantee the hash table is never full.
-  ReadOnlyRoots roots = GetReadOnlyRoots();
-  while (true) {
-    if (!Shape::IsLive(roots, KeyAt(entry))) break;
-    entry = NextProbe(entry, count++, capacity);
+  for (InternalIndex entry = FirstProbe(hash, capacity);;
+       entry = NextProbe(entry, count++, capacity)) {
+    if (!IsKey(roots, KeyAt(isolate, entry))) return entry;
   }
-  return entry;
+}
+
+template <typename Derived, typename Shape>
+InternalIndex HashTable<Derived, Shape>::FindInsertionEntry(Isolate* isolate,
+                                                            uint32_t hash) {
+  return FindInsertionEntry(isolate, ReadOnlyRoots(isolate), hash);
 }
 
 void StringTable::EnsureCapacityForDeserialization(Isolate* isolate,
@@ -6897,7 +6937,7 @@ Handle<String> StringTable::AddKeyNoResize(Isolate* isolate,
   DCHECK(table->FindEntry(isolate, key).is_not_found());
 
   // Add the new string and return it along with the string table.
-  InternalIndex entry = table->FindInsertionEntry(key->hash());
+  InternalIndex entry = table->FindInsertionEntry(isolate, key->hash());
   table->set(EntryToIndex(entry), *string);
   table->ElementAdded();
 
@@ -6954,14 +6994,14 @@ Address LookupString(Isolate* isolate, String string, String source,
   }
 
   InternalIndex entry =
-      table.FindEntry(ReadOnlyRoots(isolate), &key, key.hash());
+      table.FindEntry(isolate, ReadOnlyRoots(isolate), &key, key.hash());
   if (entry.is_not_found()) {
     // A string that's not an array index, and not in the string table,
     // cannot have been used as a property name before.
     return Smi::FromInt(ResultSentinel::kNotFound).ptr();
   }
 
-  String internalized = String::cast(table.KeyAt(entry));
+  String internalized = String::cast(table.KeyAt(isolate, entry));
   if (FLAG_thin_strings) {
     string.MakeThin(isolate, internalized);
   }
@@ -7013,7 +7053,7 @@ Handle<StringSet> StringSet::Add(Isolate* isolate, Handle<StringSet> stringset,
   if (!stringset->Has(isolate, name)) {
     stringset = EnsureCapacity(isolate, stringset);
     uint32_t hash = ShapeT::Hash(ReadOnlyRoots(isolate), *name);
-    InternalIndex entry = stringset->FindInsertionEntry(hash);
+    InternalIndex entry = stringset->FindInsertionEntry(isolate, hash);
     stringset->set(EntryToIndex(entry), *name);
     stringset->ElementAdded();
   }
@@ -7030,7 +7070,7 @@ Handle<ObjectHashSet> ObjectHashSet::Add(Isolate* isolate,
   int32_t hash = key->GetOrCreateHash(isolate).value();
   if (!set->Has(isolate, key, hash)) {
     set = EnsureCapacity(isolate, set);
-    InternalIndex entry = set->FindInsertionEntry(hash);
+    InternalIndex entry = set->FindInsertionEntry(isolate, hash);
     set->set(EntryToIndex(entry), *key);
     set->ElementAdded();
   }
@@ -7196,7 +7236,7 @@ InfoCellPair CompilationCacheTable::LookupEval(
   if (obj.IsSharedFunctionInfo()) {
     FeedbackCell feedback_cell =
         SearchLiteralsMap(*table, index + 2, *native_context);
-    return InfoCellPair(SharedFunctionInfo::cast(obj), feedback_cell);
+    return InfoCellPair(isolate, SharedFunctionInfo::cast(obj), feedback_cell);
   }
   return empty_result;
 }
@@ -7226,7 +7266,7 @@ Handle<CompilationCacheTable> CompilationCacheTable::PutScript(
   StringSharedKey key(src, shared, language_mode, kNoSourcePosition);
   Handle<Object> k = key.AsHandle(isolate);
   cache = EnsureCapacity(isolate, cache);
-  InternalIndex entry = cache->FindInsertionEntry(key.Hash());
+  InternalIndex entry = cache->FindInsertionEntry(isolate, key.Hash());
   cache->set(EntryToIndex(entry), *k);
   cache->set(EntryToIndex(entry) + 1, *value);
   cache->ElementAdded();
@@ -7258,7 +7298,7 @@ Handle<CompilationCacheTable> CompilationCacheTable::PutEval(
   }
 
   cache = EnsureCapacity(isolate, cache);
-  InternalIndex entry = cache->FindInsertionEntry(key.Hash());
+  InternalIndex entry = cache->FindInsertionEntry(isolate, key.Hash());
   Handle<Object> k =
       isolate->factory()->NewNumber(static_cast<double>(key.Hash()));
   cache->set(EntryToIndex(entry), *k);
@@ -7272,7 +7312,7 @@ Handle<CompilationCacheTable> CompilationCacheTable::PutRegExp(
     JSRegExp::Flags flags, Handle<FixedArray> value) {
   RegExpKey key(src, flags);
   cache = EnsureCapacity(isolate, cache);
-  InternalIndex entry = cache->FindInsertionEntry(key.Hash());
+  InternalIndex entry = cache->FindInsertionEntry(isolate, key.Hash());
   // We store the value in the key slot, and compare the search key
   // to the stored value with a custon IsMatch function during lookups.
   cache->set(EntryToIndex(entry), *value);
@@ -7354,7 +7394,7 @@ int BaseNameDictionary<Derived, Shape>::NextEnumerationIndex(
     for (int i = 0; i < length; i++) {
       InternalIndex index(Smi::ToInt(iteration_order->get(i)));
       DCHECK(dictionary->IsKey(dictionary->GetReadOnlyRoots(),
-                               dictionary->KeyAt(index)));
+                               dictionary->KeyAt(isolate, index)));
 
       int enum_index = PropertyDetails::kInitialIndex + i;
 
@@ -7435,20 +7475,21 @@ Handle<Derived> Dictionary<Derived, Shape>::Add(LocalIsolate* isolate,
                                                 Key key, Handle<Object> value,
                                                 PropertyDetails details,
                                                 InternalIndex* entry_out) {
-  uint32_t hash = Shape::Hash(ReadOnlyRoots(isolate), key);
+  ReadOnlyRoots roots(isolate);
+  uint32_t hash = Shape::Hash(roots, key);
   // Validate that the key is absent.
-  SLOW_DCHECK(
-      dictionary->FindEntry(ReadOnlyRoots(isolate), key).is_not_found());
+  SLOW_DCHECK(dictionary->FindEntry(isolate, key).is_not_found());
   // Check whether the dictionary should be extended.
   dictionary = Derived::EnsureCapacity(isolate, dictionary);
 
   // Compute the key object.
   Handle<Object> k = Shape::AsHandle(isolate, key);
 
-  InternalIndex entry = dictionary->FindInsertionEntry(hash);
+  InternalIndex entry = dictionary->FindInsertionEntry(
+      GetIsolateForPtrCompr(isolate), roots, hash);
   dictionary->SetEntry(entry, *k, *value, details);
-  DCHECK(dictionary->KeyAt(entry).IsNumber() ||
-         Shape::Unwrap(dictionary->KeyAt(entry)).IsUniqueName());
+  DCHECK(dictionary->KeyAt(isolate, entry).IsNumber() ||
+         Shape::Unwrap(dictionary->KeyAt(isolate, entry)).IsUniqueName());
   dictionary->ElementAdded();
   if (entry_out) *entry_out = entry;
   return dictionary;
@@ -7713,13 +7754,14 @@ void ObjectHashTableBase<Derived, Shape>::FillEntriesWithHoles(
 }
 
 template <typename Derived, typename Shape>
-Object ObjectHashTableBase<Derived, Shape>::Lookup(ReadOnlyRoots roots,
+Object ObjectHashTableBase<Derived, Shape>::Lookup(const Isolate* isolate,
                                                    Handle<Object> key,
                                                    int32_t hash) {
   DisallowHeapAllocation no_gc;
+  ReadOnlyRoots roots = this->GetReadOnlyRoots(isolate);
   DCHECK(this->IsKey(roots, *key));
 
-  InternalIndex entry = this->FindEntry(roots, key, hash);
+  InternalIndex entry = this->FindEntry(isolate, roots, key, hash);
   if (entry.is_not_found()) return roots.the_hole_value();
   return this->get(Derived::EntryToIndex(entry) + 1);
 }
@@ -7728,7 +7770,8 @@ template <typename Derived, typename Shape>
 Object ObjectHashTableBase<Derived, Shape>::Lookup(Handle<Object> key) {
   DisallowHeapAllocation no_gc;
 
-  ReadOnlyRoots roots = this->GetReadOnlyRoots();
+  const Isolate* isolate = GetIsolateForPtrCompr(*this);
+  ReadOnlyRoots roots = this->GetReadOnlyRoots(isolate);
   DCHECK(this->IsKey(roots, *key));
 
   // If the object does not have an identity hash, it was never used as a key.
@@ -7736,13 +7779,13 @@ Object ObjectHashTableBase<Derived, Shape>::Lookup(Handle<Object> key) {
   if (hash.IsUndefined(roots)) {
     return roots.the_hole_value();
   }
-  return Lookup(roots, key, Smi::ToInt(hash));
+  return Lookup(isolate, key, Smi::ToInt(hash));
 }
 
 template <typename Derived, typename Shape>
 Object ObjectHashTableBase<Derived, Shape>::Lookup(Handle<Object> key,
                                                    int32_t hash) {
-  return Lookup(this->GetReadOnlyRoots(), key, hash);
+  return Lookup(GetIsolateForPtrCompr(*this), key, hash);
 }
 
 template <typename Derived, typename Shape>
@@ -7775,7 +7818,7 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Isolate* isolate,
   DCHECK(table->IsKey(roots, *key));
   DCHECK(!value->IsTheHole(roots));
 
-  InternalIndex entry = table->FindEntry(roots, key, hash);
+  InternalIndex entry = table->FindEntry(isolate, roots, key, hash);
 
   // Key is already in table, just overwrite value.
   if (entry.is_found()) {
@@ -7786,7 +7829,7 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Isolate* isolate,
   // Rehash if more than 33% of the entries are deleted entries.
   // TODO(jochen): Consider to shrink the fixed array in place.
   if ((table->NumberOfDeletedElements() << 1) > table->NumberOfElements()) {
-    table->Rehash(roots);
+    table->Rehash(isolate);
   }
   // If we're out of luck, we didn't get a GC recently, and so rehashing
   // isn't enough to avoid a crash.
@@ -7798,13 +7841,13 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Isolate* isolate,
         isolate->heap()->CollectAllGarbage(
             Heap::kNoGCFlags, GarbageCollectionReason::kFullHashtable);
       }
-      table->Rehash(roots);
+      table->Rehash(isolate);
     }
   }
 
   // Check whether the hash table should be extended.
   table = Derived::EnsureCapacity(isolate, table);
-  table->AddEntry(table->FindInsertionEntry(hash), *key, *value);
+  table->AddEntry(table->FindInsertionEntry(isolate, hash), *key, *value);
   return table;
 }
 
@@ -7830,7 +7873,7 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Remove(
   ReadOnlyRoots roots = table->GetReadOnlyRoots();
   DCHECK(table->IsKey(roots, *key));
 
-  InternalIndex entry = table->FindEntry(roots, key, hash);
+  InternalIndex entry = table->FindEntry(isolate, roots, key, hash);
   if (entry.is_not_found()) {
     *was_present = false;
     return table;
@@ -7970,32 +8013,36 @@ Handle<JSArray> JSWeakCollection::GetEntries(Handle<JSWeakCollection> holder,
   return isolate->factory()->NewJSArrayWithElements(entries);
 }
 
-Handle<PropertyCell> PropertyCell::InvalidateEntry(
+void PropertyCell::ClearAndInvalidate(ReadOnlyRoots roots) {
+  // Cell is officially mutable henceforth.
+  DCHECK(!value().IsTheHole(roots));
+  PropertyDetails details = property_details();
+  details = details.set_cell_type(PropertyCellType::kInvalidated);
+  set_value(roots.the_hole_value());
+  set_property_details(details);
+  dependent_code().DeoptimizeDependentCodeGroup(
+      DependentCode::kPropertyCellChangedGroup);
+}
+
+// static
+Handle<PropertyCell> PropertyCell::InvalidateAndReplaceEntry(
     Isolate* isolate, Handle<GlobalDictionary> dictionary,
     InternalIndex entry) {
-  // Swap with a copy.
   Handle<PropertyCell> cell(dictionary->CellAt(entry), isolate);
   Handle<Name> name(cell->name(), isolate);
-  Handle<PropertyCell> new_cell = isolate->factory()->NewPropertyCell(name);
-  new_cell->set_value(cell->value());
-  dictionary->ValueAtPut(entry, *new_cell);
-  bool is_the_hole = cell->value().IsTheHole(isolate);
-  // Cell is officially mutable henceforth.
   PropertyDetails details = cell->property_details();
   DCHECK(details.IsConfigurable());
-  details = details.set_cell_type(is_the_hole ? PropertyCellType::kUninitialized
-                                              : PropertyCellType::kMutable);
+  DCHECK(!cell->value().IsTheHole(isolate));
+
+  // Swap with a copy.
+  Handle<PropertyCell> new_cell = isolate->factory()->NewPropertyCell(name);
+  new_cell->set_value(cell->value());
+  // Cell is officially mutable henceforth.
+  details = details.set_cell_type(PropertyCellType::kMutable);
   new_cell->set_property_details(details);
-  // Old cell is ready for invalidation.
-  if (is_the_hole) {
-    cell->set_value(ReadOnlyRoots(isolate).undefined_value());
-  } else {
-    cell->set_value(ReadOnlyRoots(isolate).the_hole_value());
-  }
-  details = details.set_cell_type(PropertyCellType::kInvalidated);
-  cell->set_property_details(details);
-  cell->dependent_code().DeoptimizeDependentCodeGroup(
-      DependentCode::kPropertyCellChangedGroup);
+  dictionary->ValueAtPut(entry, *new_cell);
+
+  cell->ClearAndInvalidate(ReadOnlyRoots(isolate));
   return new_cell;
 }
 
@@ -8017,6 +8064,14 @@ static bool RemainsConstantType(Handle<PropertyCell> cell,
   return false;
 }
 
+// static
+PropertyCellType PropertyCell::TypeForUninitializedCell(Isolate* isolate,
+                                                        Handle<Object> value) {
+  if (value->IsUndefined(isolate)) return PropertyCellType::kUndefined;
+  return PropertyCellType::kConstant;
+}
+
+// static
 PropertyCellType PropertyCell::UpdatedType(Isolate* isolate,
                                            Handle<PropertyCell> cell,
                                            Handle<Object> value,
@@ -8027,8 +8082,7 @@ PropertyCellType PropertyCell::UpdatedType(Isolate* isolate,
     switch (type) {
       // Only allow a cell to transition once into constant state.
       case PropertyCellType::kUninitialized:
-        if (value->IsUndefined(isolate)) return PropertyCellType::kUndefined;
-        return PropertyCellType::kConstant;
+        return TypeForUninitializedCell(isolate, value);
       case PropertyCellType::kInvalidated:
         return PropertyCellType::kMutable;
       default:
@@ -8077,7 +8131,7 @@ Handle<PropertyCell> PropertyCell::PrepareForValue(
   PropertyCellType new_type =
       UpdatedType(isolate, cell, value, original_details);
   if (invalidate) {
-    cell = PropertyCell::InvalidateEntry(isolate, dictionary, entry);
+    cell = PropertyCell::InvalidateAndReplaceEntry(isolate, dictionary, entry);
   }
 
   // Install new property details.
@@ -8313,8 +8367,7 @@ EXTERN_DEFINE_HASH_TABLE(CompilationCacheTable, CompilationCacheShape)
 EXTERN_DEFINE_HASH_TABLE(ObjectHashSet, ObjectHashSetShape)
 
 EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(ObjectHashTable, ObjectHashTableShape)
-EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(EphemeronHashTable,
-                                     EphemeronHashTableShape)
+EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(EphemeronHashTable, ObjectHashTableShape)
 
 EXTERN_DEFINE_DICTIONARY(SimpleNumberDictionary, SimpleNumberDictionaryShape)
 EXTERN_DEFINE_DICTIONARY(NumberDictionary, NumberDictionaryShape)

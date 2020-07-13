@@ -37,22 +37,9 @@ namespace compiler {
 namespace {
 
 using Label = CodeAssemblerLabel;
-using Variable = CodeAssemblerVariable;
 template <class T>
 using TVariable = TypedCodeAssemblerVariable<T>;
 using PromiseResolvingFunctions = TorqueStructPromiseResolvingFunctions;
-
-Handle<String> MakeString(const char* str) {
-  Isolate* isolate = CcTest::i_isolate();
-  Factory* factory = isolate->factory();
-  return factory->InternalizeUtf8String(str);
-}
-
-Handle<String> MakeName(const char* str, int suffix) {
-  EmbeddedVector<char, 128> buffer;
-  SNPrintF(buffer, "%s%d", str, suffix);
-  return MakeString(buffer.begin());
-}
 
 int sum10(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7,
           int a8, int a9) {
@@ -431,8 +418,7 @@ TEST(FixedArrayAccessSmiIndex) {
   Handle<FixedArray> array = isolate->factory()->NewFixedArray(5);
   array->set(4, Smi::FromInt(733));
   m.Return(m.LoadFixedArrayElement(m.HeapConstant(array),
-                                   m.SmiTag(m.IntPtrConstant(4)), 0,
-                                   CodeStubAssembler::SMI_PARAMETERS));
+                                   m.SmiTag(m.IntPtrConstant(4)), 0));
   FunctionTester ft(asm_tester.GenerateCode());
   MaybeHandle<Object> result = ft.Call();
   CHECK_EQ(733, Handle<Smi>::cast(result.ToHandleChecked())->value());
@@ -1090,7 +1076,7 @@ TEST(TransitionLookup) {
       name = factory->NewSymbol();
     } else {
       int random_key = rand_gen.NextInt(Smi::kMaxValue);
-      name = MakeName("p", random_key);
+      name = CcTest::MakeName("p", random_key);
     }
     keys[i] = name;
 
@@ -2155,79 +2141,6 @@ TEST(Arguments) {
   CHECK_EQ(*isolate->factory()->undefined_value(), *result);
 }
 
-TEST(ArgumentsWithSmiConstantIndices) {
-  Isolate* isolate(CcTest::InitIsolateOnce());
-
-  const int kNumParams = 4;
-  CodeAssemblerTester asm_tester(isolate, kNumParams);
-  CodeStubAssembler m(asm_tester.state());
-
-  CodeStubArguments arguments(&m, m.SmiConstant(3));
-
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(m.SmiConstant(0)),
-                               m.SmiConstant(12)));
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(m.SmiConstant(1)),
-                               m.SmiConstant(13)));
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(m.SmiConstant(2)),
-                               m.SmiConstant(14)));
-
-  arguments.PopAndReturn(arguments.GetReceiver());
-
-  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
-                                  Handle<Smi>(Smi::FromInt(12), isolate),
-                                  Handle<Smi>(Smi::FromInt(13), isolate),
-                                  Handle<Smi>(Smi::FromInt(14), isolate))
-                              .ToHandleChecked();
-  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
-}
-
-TNode<Smi> NonConstantSmi(CodeStubAssembler* m, int value) {
-  // Generate a SMI with the given value and feed it through a Phi so it can't
-  // be inferred to be constant.
-  Variable var(m, MachineRepresentation::kTagged, m->SmiConstant(value));
-  Label dummy_done(m);
-  // Even though the Goto always executes, it will taint the variable and thus
-  // make it appear non-constant when used later.
-  m->GotoIf(m->Int32Constant(1), &dummy_done);
-  var.Bind(m->SmiConstant(value));
-  m->Goto(&dummy_done);
-  m->BIND(&dummy_done);
-
-  // Ensure that the above hackery actually created a non-constant SMI.
-  Smi smi_constant;
-  CHECK(!m->ToSmiConstant(var.value(), &smi_constant));
-
-  return m->UncheckedCast<Smi>(var.value());
-}
-
-TEST(ArgumentsWithSmiIndices) {
-  Isolate* isolate(CcTest::InitIsolateOnce());
-
-  const int kNumParams = 4;
-  CodeAssemblerTester asm_tester(isolate, kNumParams);
-  CodeStubAssembler m(asm_tester.state());
-
-  CodeStubArguments arguments(&m, m.SmiConstant(3));
-
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(NonConstantSmi(&m, 0)),
-                               m.SmiConstant(12)));
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(NonConstantSmi(&m, 1)),
-                               m.SmiConstant(13)));
-  CSA_ASSERT(&m, m.TaggedEqual(arguments.AtIndex(NonConstantSmi(&m, 2)),
-                               m.SmiConstant(14)));
-
-  arguments.PopAndReturn(arguments.GetReceiver());
-
-  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
-                                  Handle<Smi>(Smi::FromInt(12), isolate),
-                                  Handle<Smi>(Smi::FromInt(13), isolate),
-                                  Handle<Smi>(Smi::FromInt(14), isolate))
-                              .ToHandleChecked();
-  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
-}
-
 TEST(ArgumentsForEach) {
   Isolate* isolate(CcTest::InitIsolateOnce());
 
@@ -2503,7 +2416,7 @@ TEST(IsSymbol) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  Node* const symbol = m.Parameter(0);
+  TNode<HeapObject> const symbol = m.CAST(m.Parameter(0));
   m.Return(m.SelectBooleanConstant(m.IsSymbol(symbol)));
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
@@ -2522,7 +2435,7 @@ TEST(IsPrivateSymbol) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  Node* const symbol = m.Parameter(0);
+  TNode<HeapObject> const symbol = m.CAST(m.Parameter(0));
   m.Return(m.SelectBooleanConstant(m.IsPrivateSymbol(symbol)));
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
@@ -2576,7 +2489,7 @@ TEST(CreatePromiseResolvingFunctionsContext) {
       ft.Call(isolate->factory()->undefined_value()).ToHandleChecked();
   CHECK(result->IsContext());
   Handle<Context> context_js = Handle<Context>::cast(result);
-  CHECK_EQ(isolate->native_context()->scope_info(), context_js->scope_info());
+  CHECK_EQ(isolate->root(RootIndex::kEmptyScopeInfo), context_js->scope_info());
   CHECK_EQ(*isolate->native_context(), context_js->native_context());
   CHECK(context_js->get(PromiseBuiltins::kPromiseSlot).IsJSPromise());
   CHECK_EQ(ReadOnlyRoots(isolate).false_value(),
@@ -2734,7 +2647,7 @@ TEST(CreatePromiseGetCapabilitiesExecutorContext) {
   CHECK(result_obj->IsContext());
   Handle<Context> context_js = Handle<Context>::cast(result_obj);
   CHECK_EQ(PromiseBuiltins::kCapabilitiesContextLength, context_js->length());
-  CHECK_EQ(isolate->native_context()->scope_info(), context_js->scope_info());
+  CHECK_EQ(isolate->root(RootIndex::kEmptyScopeInfo), context_js->scope_info());
   CHECK_EQ(*isolate->native_context(), context_js->native_context());
   CHECK(
       context_js->get(PromiseBuiltins::kCapabilitySlot).IsPromiseCapability());
@@ -2783,7 +2696,8 @@ TEST(NewPromiseCapability) {
 
     for (auto&& callback : callbacks) {
       Handle<Context> context(Context::cast(callback->context()), isolate);
-      CHECK_EQ(isolate->native_context()->scope_info(), context->scope_info());
+      CHECK_EQ(isolate->root(RootIndex::kEmptyScopeInfo),
+               context->scope_info());
       CHECK_EQ(*isolate->native_context(), context->native_context());
       CHECK_EQ(PromiseBuiltins::kPromiseContextLength, context->length());
       CHECK_EQ(context->get(PromiseBuiltins::kPromiseSlot), result->promise());
@@ -3480,18 +3394,18 @@ TEST(SingleInputPhiElimination) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   {
     CodeStubAssembler m(asm_tester.state());
-    Variable temp1(&m, MachineRepresentation::kTagged);
-    Variable temp2(&m, MachineRepresentation::kTagged);
+    TVariable<Smi> temp1(&m);
+    TVariable<Smi> temp2(&m);
     Label temp_label(&m, {&temp1, &temp2});
     Label end_label(&m, {&temp1, &temp2});
-    temp1.Bind(m.Parameter(1));
-    temp2.Bind(m.Parameter(1));
+    temp1 = m.CAST(m.Parameter(1));
+    temp2 = m.CAST(m.Parameter(1));
     m.Branch(m.TaggedEqual(m.UncheckedCast<Object>(m.Parameter(0)),
                            m.UncheckedCast<Object>(m.Parameter(1))),
              &end_label, &temp_label);
-    temp1.Bind(m.Parameter(2));
-    temp2.Bind(m.Parameter(2));
     m.BIND(&temp_label);
+    temp1 = m.CAST(m.Parameter(2));
+    temp2 = m.CAST(m.Parameter(2));
     m.Goto(&end_label);
     m.BIND(&end_label);
     m.Return(m.UncheckedCast<Object>(temp1.value()));
@@ -3645,8 +3559,8 @@ TEST(TestCallBuiltinInlineTrampoline) {
   options.use_pc_relative_calls_and_jumps = false;
   options.isolate_independent_code = false;
   FunctionTester ft(asm_tester.GenerateCode(options), kNumParams);
-  MaybeHandle<Object> result = ft.Call(MakeString("abcdef"));
-  CHECK(String::Equals(isolate, MakeString("abcdefabcdef"),
+  MaybeHandle<Object> result = ft.Call(CcTest::MakeString("abcdef"));
+  CHECK(String::Equals(isolate, CcTest::MakeString("abcdefabcdef"),
                        Handle<String>::cast(result.ToHandleChecked())));
 }
 
@@ -3671,8 +3585,8 @@ DISABLED_TEST(TestCallBuiltinIndirectLoad) {
   options.use_pc_relative_calls_and_jumps = false;
   options.isolate_independent_code = true;
   FunctionTester ft(asm_tester.GenerateCode(options), kNumParams);
-  MaybeHandle<Object> result = ft.Call(MakeString("abcdef"));
-  CHECK(String::Equals(isolate, MakeString("abcdefabcdef"),
+  MaybeHandle<Object> result = ft.Call(CcTest::MakeString("abcdef"));
+  CHECK(String::Equals(isolate, CcTest::MakeString("abcdefabcdef"),
                        Handle<String>::cast(result.ToHandleChecked())));
 }
 
