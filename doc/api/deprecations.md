@@ -2707,12 +2707,12 @@ Type: Runtime
 `Transform._transformState` will be removed in future versions where it is
 no longer required due to simplification of the implementation.
 
-<a id="DEP0XXX"></a>
-### DEP0XXX: `socket.bufferSize`
+<a id="DEP0144"></a>
+### DEP0144: `socket.bufferSize`
 <!-- YAML
 changes:
-  - version: REPLACEME
-    pr-url: https://github.com/nodejs/node/pull/REPLACEME
+  - version: v14.6.0
+    pr-url: https://github.com/nodejs/node/pull/v14.6.0
     description: Documentation-only deprecation.
 -->
 
